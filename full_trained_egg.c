@@ -63,7 +63,7 @@ int8_t clipped_add(int32_t a, int32_t b) {
 }
 
 // RNG helpers
-uint32_t xorshift32(uint32_t *state) {
+static inline uint32_t xorshift32(uint32_t *state) {
     uint32_t x = *state;
     x ^= x << 13;
     x ^= x >> 17;
@@ -72,7 +72,7 @@ uint32_t xorshift32(uint32_t *state) {
     return x;
 }
 
-int8_t gen_noise_val(uint32_t *rng) {
+static inline int8_t gen_noise_val(uint32_t *rng) {
     return (int8_t)((xorshift32(rng) & 31) - 16);
 }
 
