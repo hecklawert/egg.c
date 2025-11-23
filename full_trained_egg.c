@@ -7,11 +7,11 @@
 
 // --- Configuration [cite: 275, 277, 288] ---
 #define VOCAB_SIZE 256        // Byte-level tokenization
-#define HIDDEN_DIM 256        // Model width
+#define HIDDEN_DIM 128        // Model width
 #define N_LAYERS 4            // Number of layers
 #define SEQ_LEN 64            // Sequence length for BPTT (truncated)
 #define POPULATION_SIZE 64    // Number of perturbations per step
-#define BATCH_SIZE 8          // Parallel streams
+#define BATCH_SIZE 32          // Parallel streams
 #define FIXED_POINT 4         // 4 bits for fractional part
 #define SIGMA_SHIFT 4         // Noise scale (bitwise shift)
 #define UPDATE_THRESHOLD 100  // Votes needed to flip a weight [cite: 1023]
@@ -85,9 +85,10 @@ void matmul_perturbed(
     uint32_t layer_seed, int noise_sign
 ) {
     // 1. Generate Noise Vectors A and B on the fly
-    // To match JAX, we would need the exact same RNG, here we just ensure consistency
-    int8_t *A = (int8_t*)malloc(rows);
-    int8_t *B = (int8_t*)malloc(cols);
+    // Optimization: Use Stack VLA instead of malloc
+    int8_t A[rows];
+    int8_t B[cols];
+    
     uint32_t rng = layer_seed;
     for(int i=0; i<rows; i++) A[i] = gen_noise_val(&rng);
     for(int i=0; i<cols; i++) B[i] = gen_noise_val(&rng);
@@ -112,7 +113,6 @@ void matmul_perturbed(
         else if(res < MIN_VAL) out[i] = MIN_VAL;
         else out[i] = (int8_t)res;
     }
-    free(A); free(B);
 }
 
 // --- Layer Norm [cite: 965] ---
@@ -227,9 +227,12 @@ void update_matrix(
     const int *fitnesses, // Array of fitness values per population member
     int pop_size
 ) {
-    int32_t *votes = (int32_t*)calloc(rows * cols, sizeof(int32_t));
-    int8_t *A = (int8_t*)malloc(rows);
-    int8_t *B = (int8_t*)malloc(cols);
+    // Optimization: Use persistent buffer for votes and stack for noise vectors
+    static int32_t votes[65536 * 4]; // Handle up to HIDDEN_DIM * (HIDDEN_DIM * 4)
+    memset(votes, 0, rows * cols * sizeof(int32_t));
+
+    int8_t A[rows];
+    int8_t B[cols];
 
     // Reconstruct Noise and Accumulate Votes
     for(int p=0; p<pop_size; p+=2) {
@@ -253,7 +256,6 @@ void update_matrix(
         if(votes[i] > UPDATE_THRESHOLD && W[i] < MAX_VAL) W[i]++;
         else if(votes[i] < -UPDATE_THRESHOLD && W[i] > MIN_VAL) W[i]--;
     }
-    free(votes); free(A); free(B);
 }
 
 // --- Sampling Helper ---
@@ -398,7 +400,7 @@ int main() {
         }
 
         // Monitoring
-        if(step % 1 == 0) {
+        if(step % 10 == 0) {
             forward_pass(model, &ds.data[start_idx], SEQ_LEN, logits, step_seed, 0);
             int32_t loss_val = compute_loss(logits, ds.data[start_idx + SEQ_LEN]);
             double elapsed_sec = (double)(clock() - start_time) / CLOCKS_PER_SEC;
