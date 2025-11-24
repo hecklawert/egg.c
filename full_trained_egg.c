@@ -12,11 +12,11 @@
 #define HIDDEN_DIM 128        // Model width
 #define N_LAYERS 4            // Number of layers
 #define SEQ_LEN 4096            // Sequence length for BPTT (truncated)
-#define POPULATION_SIZE 64    // Number of perturbations per step
+#define POPULATION_SIZE 128    // Number of perturbations per step
 #define BATCH_SIZE 8          // Parallel streams
 #define FIXED_POINT 4         // 4 bits for fractional part
 #define SIGMA_SHIFT 4         // Noise scale (bitwise shift)
-#define UPDATE_THRESHOLD 80  // Votes needed to flip a weight [cite: 1023]
+#define UPDATE_THRESHOLD 160  // Votes needed to flip a weight [cite: 1023]
 #define MAX_VAL 127
 #define MIN_VAL -127
 
@@ -64,17 +64,6 @@ int8_t clipped_add(int32_t a, int32_t b) {
     if (res > MAX_VAL) return MAX_VAL;
     if (res < MIN_VAL) return MIN_VAL;
     return (int8_t)res;
-}
-
-// NEON-optimized saturated add for vectors
-static inline int8x16_t vclipped_add_s8(int32x4_t a[4], int32x4_t b[4]) {
-    // This function signature doesn't really make sense for element-wise int8 add.
-    // Usually we just use vqadd_s8 for saturated addition of 8-bit vectors.
-    // But the original clipped_add works on 32-bit intermediates.
-    // If inputs are 32-bit, we can't easily pack back to 8-bit without checks.
-    // However, for standard accumulation, our ranges might exceed int8 range significantly before clipping.
-    // Let's stick to specific logic in matmul where we handle accumulation in int32.
-    return vdupq_n_s8(0); 
 }
 
 // Simple RNG helpers for scalar usage
