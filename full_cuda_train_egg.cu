@@ -8,12 +8,14 @@
 
 // --- Configuration ---
 #define SM_CORES 128
+#define WARP_SIZE 32
+#define BLOCK_THREADS 256
+#define BATCH WARP_SIZE
 #define VOCAB_SIZE 256
 #define HIDDEN_DIM (SM_CORES * 1)
 #define N_LAYERS 4
 #define SEQ_LEN 256
-#define BATCH 8 // Streaming batch size per block
-#define POPULATION_SIZE SM_CORES * 16 * 4
+#define POPULATION_SIZE (SM_CORES * 128)
 #define SHARED_STRIDE (HIDDEN_DIM * 4)
 #define FIXED_POINT 4
 #define SIGMA_SHIFT 4
@@ -176,7 +178,7 @@ __device__ __forceinline__ long long blockReduceSum64(long long val) {
     return shared[0];
 }
 
-extern __shared__ int8_t s_mem[]; // Shared memory: [BATCH][SHARED_STRIDE]
+extern __shared__ int8_t s_mem[]; 
 
 __global__ void generate_sequence_kernel(
     const EggModel * __restrict__ model,
@@ -224,10 +226,6 @@ __global__ void generate_sequence_kernel(
              const int8_t *w0 = &model->gru_weights[l][0][0];
              const int8_t *w1 = &model->gru_weights[l][1][0];
              
-             // Computes W0 (Buf 3) and W1 (Buf 2) logic:
-             // Read Buf 0 (X) and Buf 1 (H).
-             // Buffer logic: W0 -> Buf 3 (Temp), W1 -> Buf 2 (Target for gating later)
-             // But wait, W1 * H.
              KERNEL_LOOP(i, HIDDEN_DIM) {
                  long long acc0 = 0, acc1 = 0;
                  for(int k=0; k<HIDDEN_DIM; k++) {
@@ -391,7 +389,7 @@ __global__ void generate_sequence_kernel(
     }
 }
 
-__global__ void __launch_bounds__(256) train_sequence_kernel(
+__global__ void __launch_bounds__(BLOCK_THREADS) train_sequence_kernel(
     const uint8_t * __restrict__ dataset,
     long data_len,
     int start_idx,
@@ -400,423 +398,321 @@ __global__ void __launch_bounds__(256) train_sequence_kernel(
     int32_t *accum_loss,
     uint32_t step_seed
 ) {
-    int block_p_idx = blockIdx.x; 
-    int8_t *s_ptr = s_mem;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int p_idx = blockIdx.x * (BLOCK_THREADS / WARP_SIZE) + warp_id;
     
-    // Load State
-    int8_t h_local[BATCH][N_LAYERS][MAX_STRIDE];
+    if (p_idx >= POPULATION_SIZE) return;
+
+    int8_t *my_s_ptr = &s_mem[warp_id * SHARED_STRIDE];
     
-    KERNEL_LOOP(i, HIDDEN_DIM) {
-        for(int b=0; b<BATCH; b++) {
-            int p_idx = block_p_idx * BATCH + b;
-            for(int l=0; l<N_LAYERS; l++) {
-                 h_local[b][l][(i - threadIdx.x)/blockDim.x] = pop_states[p_idx * (N_LAYERS * HIDDEN_DIM) + l * HIDDEN_DIM + i];
-            }
+    // Load State: Single batch item per Warp
+    int8_t h_local[N_LAYERS][MAX_STRIDE];
+    
+    for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+        int sub = i / WARP_SIZE;
+        for(int l=0; l<N_LAYERS; l++) {
+             h_local[l][sub] = pop_states[p_idx * (N_LAYERS * HIDDEN_DIM) + l * HIDDEN_DIM + i];
         }
     }
     
-    long long my_loss[BATCH]; 
-    for(int b=0; b<BATCH; b++) my_loss[b] = 0;
-    
+    long long my_loss = 0;
+
+    // Prepare Data Indices
+    long pair_idx = p_idx / 2;
+    long stride = data_len / (POPULATION_SIZE / 2);
+    long stream_pos = (start_idx + (pair_idx * stride)) % (data_len - SEQ_LEN);
+    int ns = (p_idx % 2 == 0) ? 1 : -1;
+
     for (int t = 0; t < SEQ_LEN; t++) {
-        __syncthreads(); 
+        __syncwarp();
         
-        for(int b=0; b<BATCH; b++) {
-            int p_idx = block_p_idx * BATCH + b;
-            long pair_idx = p_idx / 2;
-            long stride = data_len / (POPULATION_SIZE / 2);
-            long stream_pos = (start_idx + (pair_idx * stride)) % (data_len - SEQ_LEN);
-            uint8_t input_token = dataset[stream_pos + t];
-            
-            KERNEL_LOOP(i, HIDDEN_DIM) {
-                s_ptr[b * SHARED_STRIDE + i] = model->embedding[input_token * HIDDEN_DIM + i];
-            }
+        uint8_t input_token = dataset[stream_pos + t];
+        
+        for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+            my_s_ptr[i] = model->embedding[input_token * HIDDEN_DIM + i];
         }
-        __syncthreads();
+        __syncwarp();
         
         for (int l = 0; l < N_LAYERS; l++) {
-            int8_t gru_resid[BATCH][MAX_STRIDE];
-
             // LN 1
-            for(int b=0; b<BATCH; b++) {
-                int8_t *sx_b = &s_ptr[b * SHARED_STRIDE];
-                long long local_sum = 0;
-                
-                KERNEL_LOOP(i, HIDDEN_DIM) {
-                    int8_t val = sx_b[i];
-                    gru_resid[b][(i - threadIdx.x)/blockDim.x] = val;
-                    local_sum += abs((long long)val);
-                }
-                long long sum = blockReduceSum64(local_sum);
-                if(!sum) sum=1; long long mean = sum/HIDDEN_DIM; if(!mean) mean=1;
-                
-                KERNEL_LOOP(i, HIDDEN_DIM) {
-                    sx_b[i] = clip(((long long)sx_b[i] * model->ln_weights[l][0][i]) / mean);
-                }
+            long long local_sum = 0;
+            int8_t gru_resid[MAX_STRIDE];
+
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                int8_t val = my_s_ptr[i];
+                gru_resid[i / WARP_SIZE] = val;
+                local_sum += abs((long long)val);
             }
-            __syncthreads();
+            long long sum = warpReduceSum64(local_sum);
+            if(!sum) sum=1; long long mean = sum/HIDDEN_DIM; if(!mean) mean=1;
+            
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                my_s_ptr[i] = clip(((long long)my_s_ptr[i] * model->ln_weights[l][0][i]) / mean);
+            }
+            __syncwarp();
             
             // Copy H to Shared (Buf 1)
-            for(int b=0; b<BATCH; b++) {
-                 KERNEL_LOOP(i, HIDDEN_DIM) s_ptr[b*SHARED_STRIDE + HIDDEN_DIM + i] = h_local[b][l][(i - threadIdx.x)/blockDim.x];
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                 my_s_ptr[HIDDEN_DIM + i] = h_local[l][i / WARP_SIZE];
             }
-            __syncthreads();
+            __syncwarp();
 
-            // Rank-1 Precalc (xB)
-            long long xB_m1[BATCH], xB_m2[BATCH], xB_m3[BATCH], xB_m4[BATCH];
+            // Rank-1 Precalc (xB) for GRU Phase 1
+            uint32_t seed = (step_seed + pair_idx) + (l * 100); 
             
-            for(int b=0; b<BATCH; b++) {
-                int p_idx = block_p_idx * BATCH + b;
-                int pair_idx = p_idx / 2;
-                uint32_t seed = (step_seed + pair_idx) + (l * 100); 
+            long long ls_1 = 0, ls_2 = 0;
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                int8_t b1 = noise_from_hash(seed + SEED_OFF_GRU_M1 + HIDDEN_DIM, i);
+                ls_1 += (long long)my_s_ptr[i] * b1;
                 
-                long long ls_1 = 0, ls_2 = 0;
-                KERNEL_LOOP(i, HIDDEN_DIM) {
-                    int8_t b1 = noise_from_hash(seed + SEED_OFF_GRU_M1 + HIDDEN_DIM, i);
-                    ls_1 += (long long)s_ptr[b*SHARED_STRIDE+i] * b1;
-                    
-                    int8_t b2 = noise_from_hash(seed + SEED_OFF_GRU_M2 + HIDDEN_DIM, i);
-                    ls_2 += (long long)s_ptr[b*SHARED_STRIDE+HIDDEN_DIM+i] * b2;
-                }
-                xB_m1[b] = blockReduceSum64(ls_1);
-                xB_m2[b] = blockReduceSum64(ls_2);
+                int8_t b2 = noise_from_hash(seed + SEED_OFF_GRU_M2 + HIDDEN_DIM, i);
+                ls_2 += (long long)my_s_ptr[HIDDEN_DIM + i] * b2;
             }
+            long long xB_m1 = warpReduceSum64(ls_1);
+            long long xB_m2 = warpReduceSum64(ls_2);
 
             // MatMul 1 & 2 + Gates
             const int8_t *w0 = &model->gru_weights[l][0][0];
             const int8_t *w1 = &model->gru_weights[l][1][0];
             
-            KERNEL_LOOP(i, HIDDEN_DIM) {
-                 long long dot1[BATCH]; // In Registers
-                 long long dot2[BATCH]; 
-                 for(int b=0; b<BATCH; b++) { dot1[b]=0; dot2[b]=0; }
-
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                 long long dot1 = 0;
+                 long long dot2 = 0;
+                 
                  for(int k=0; k<HIDDEN_DIM; k++) {
-                    int8_t v1 = w0[k*HIDDEN_DIM + i];
-                    int8_t v2 = w1[k*HIDDEN_DIM + i];
-                    for(int b=0; b<BATCH; b++) {
-                        dot1[b] += (long long)s_ptr[b*SHARED_STRIDE + k] * v1;
-                        dot2[b] += (long long)s_ptr[b*SHARED_STRIDE + HIDDEN_DIM + k] * v2;
-                    }
-                }
-                
-                // Noise & Gates
-                for(int b=0; b<BATCH; b++) {
-                     int p_idx = block_p_idx * BATCH + b;
-                     int ns = (p_idx % 2 == 0) ? 1 : -1;
-                     int pair_idx = p_idx / 2;
-                     uint32_t seed = (step_seed + pair_idx) + (l * 100);
-                     
-                     int8_t a1 = noise_from_hash(seed + SEED_OFF_GRU_M1, i);
-                     if(ns!=0) dot1[b] += ((xB_m1[b] * (long long)a1) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
-                     
-                     int8_t a2 = noise_from_hash(seed + SEED_OFF_GRU_M2, i);
-                     if(ns!=0) dot2[b] += ((xB_m2[b] * (long long)a2) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
-                     
-                     int8_t r1 = dot1[b] >> 8;
-                     int8_t r2 = dot2[b] >> 8;
-                     int8_t ft = clip((long long)r1 + r2 + model->gru_biases[l][0][i]);
-                     int8_t h_val = s_ptr[b*SHARED_STRIDE + HIDDEN_DIM + i];
-                     int8_t gated = (int8_t)(((long long)(ft + 127) * h_val) >> 8);
-                     
-                     s_ptr[b*SHARED_STRIDE + 2*HIDDEN_DIM + i] = gated; // Buf 2
-                     s_ptr[b*SHARED_STRIDE + 3*HIDDEN_DIM + i] = ft;    // Buf 3
-                }
+                    dot1 += (long long)my_s_ptr[k] * w0[k*HIDDEN_DIM + i];
+                    dot2 += (long long)my_s_ptr[HIDDEN_DIM + k] * w1[k*HIDDEN_DIM + i];
+                 }
+                 
+                 // Noise
+                 int8_t a1 = noise_from_hash(seed + SEED_OFF_GRU_M1, i);
+                 if(ns!=0) dot1 += ((xB_m1 * (long long)a1) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
+                 
+                 int8_t a2 = noise_from_hash(seed + SEED_OFF_GRU_M2, i);
+                 if(ns!=0) dot2 += ((xB_m2 * (long long)a2) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
+                 
+                 int8_t ft = clip((dot1 >> 8) + (dot2 >> 8) + model->gru_biases[l][0][i]);
+                 int8_t h_val = my_s_ptr[HIDDEN_DIM + i];
+                 int8_t gated = (int8_t)(((long long)(ft + 127) * h_val) >> 8);
+                 
+                 my_s_ptr[2*HIDDEN_DIM + i] = gated; // Buf 2
+                 my_s_ptr[3*HIDDEN_DIM + i] = ft;    // Buf 3
             }
-            __syncthreads();
+            __syncwarp();
             
             // Rank-1 M3 & M4
-            for(int b=0; b<BATCH; b++) {
-                int p_idx = block_p_idx * BATCH + b;
-                int pair_idx = p_idx / 2;
-                uint32_t seed = (step_seed + pair_idx) + (l * 100);
+            long long ls_3=0, ls_4=0;
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                int8_t b3 = noise_from_hash(seed + SEED_OFF_GRU_M3 + HIDDEN_DIM, i);
+                ls_3 += (long long)my_s_ptr[i] * b3;
                 
-                long long ls_3=0, ls_4=0;
-                KERNEL_LOOP(i, HIDDEN_DIM) {
-                    int8_t b3 = noise_from_hash(seed + SEED_OFF_GRU_M3 + HIDDEN_DIM, i);
-                    ls_3 += (long long)s_ptr[b*SHARED_STRIDE+i] * b3;
-                    
-                    int8_t b4 = noise_from_hash(seed + SEED_OFF_GRU_M4 + HIDDEN_DIM, i);
-                    ls_4 += (long long)s_ptr[b*SHARED_STRIDE + 2*HIDDEN_DIM + i] * b4;
-                }
-                xB_m3[b] = blockReduceSum64(ls_3);
-                xB_m4[b] = blockReduceSum64(ls_4);
+                int8_t b4 = noise_from_hash(seed + SEED_OFF_GRU_M4 + HIDDEN_DIM, i);
+                ls_4 += (long long)my_s_ptr[2*HIDDEN_DIM + i] * b4;
             }
+            long long xB_m3 = warpReduceSum64(ls_3);
+            long long xB_m4 = warpReduceSum64(ls_4);
             
             // Phase 2
             const int8_t *w2 = &model->gru_weights[l][2][0];
             const int8_t *w3 = &model->gru_weights[l][3][0];
             
-            KERNEL_LOOP(i, HIDDEN_DIM) {
-                long long dot1[BATCH], dot2[BATCH];  
-                for(int b=0; b<BATCH; b++) { dot1[b]=0; dot2[b]=0; }
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                long long dot1 = 0;
+                long long dot2 = 0;
                 
                 for(int k=0; k<HIDDEN_DIM; k++) {
-                    int8_t v3 = w2[k*HIDDEN_DIM + i]; 
-                    int8_t v4 = w3[k*HIDDEN_DIM + i]; 
-                    for(int b=0; b<BATCH; b++) {
-                        dot1[b] += (long long)s_ptr[b*SHARED_STRIDE + k] * v3;
-                        dot2[b] += (long long)s_ptr[b*SHARED_STRIDE + 2*HIDDEN_DIM + k] * v4;
-                    }
+                    dot1 += (long long)my_s_ptr[k] * w2[k*HIDDEN_DIM + i];
+                    dot2 += (long long)my_s_ptr[2*HIDDEN_DIM + k] * w3[k*HIDDEN_DIM + i];
                 }
                 
-                for(int b=0; b<BATCH; b++) {
-                     int p_idx = block_p_idx * BATCH + b;
-                     int ns = (p_idx % 2 == 0) ? 1 : -1;
-                     int pair_idx = p_idx / 2;
-                     uint32_t seed = (step_seed + pair_idx) + (l * 100);
-                     
-                     int8_t a3 = noise_from_hash(seed + SEED_OFF_GRU_M3, i);
-                     if(ns!=0) dot1[b] += ((xB_m3[b] * (long long)a3) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
-                     
-                     int8_t a4 = noise_from_hash(seed + SEED_OFF_GRU_M4, i);
-                     if(ns!=0) dot2[b] += ((xB_m4[b] * (long long)a4) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
-                     
-                     int8_t ht = clip((dot1[b] >> 8) + (dot2[b] >> 8) + model->gru_biases[l][1][i]);
-                     
-                     int8_t ft = s_ptr[b*SHARED_STRIDE + 3*HIDDEN_DIM + i];
-                     int8_t h_curr = h_local[b][l][(i - threadIdx.x)/blockDim.x];
-                     int32_t diff = ht - h_curr;
-                     int32_t update = ((int32_t)(ft + 127) * diff) >> 8;
-                     h_curr = clip(h_curr + update);
-                     h_local[b][l][(i - threadIdx.x)/blockDim.x] = h_curr;
-                     
-                     s_ptr[b*SHARED_STRIDE + i] = clip((long long)h_curr + gru_resid[b][(i - threadIdx.x)/blockDim.x]); 
-                }
+                int8_t a3 = noise_from_hash(seed + SEED_OFF_GRU_M3, i);
+                if(ns!=0) dot1 += ((xB_m3 * (long long)a3) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
+                
+                int8_t a4 = noise_from_hash(seed + SEED_OFF_GRU_M4, i);
+                if(ns!=0) dot2 += ((xB_m4 * (long long)a4) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
+                
+                int8_t ht = clip((dot1 >> 8) + (dot2 >> 8) + model->gru_biases[l][1][i]);
+                
+                int8_t ft = my_s_ptr[3*HIDDEN_DIM + i];
+                int8_t h_curr = h_local[l][i / WARP_SIZE];
+                int32_t diff = ht - h_curr;
+                int32_t update = ((int32_t)(ft + 127) * diff) >> 8;
+                h_curr = clip(h_curr + update);
+                h_local[l][i / WARP_SIZE] = h_curr;
+                
+                my_s_ptr[i] = clip((long long)h_curr + gru_resid[i / WARP_SIZE]); 
             }
-            __syncthreads(); 
+            __syncwarp(); 
             
-            // Pre-LN Resid (Use Register)
-            int8_t mlp_resid[BATCH][MAX_STRIDE];
-            KERNEL_LOOP(i, HIDDEN_DIM) {
-                for(int b=0; b<BATCH; b++) mlp_resid[b][(i - threadIdx.x)/blockDim.x] = s_ptr[b*SHARED_STRIDE + i];
+            // Pre-LN Resid
+            int8_t mlp_resid[MAX_STRIDE];
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                mlp_resid[i / WARP_SIZE] = my_s_ptr[i];
             }
 
             // MLP LN 2
-            for(int b=0; b<BATCH; b++) {
-                long long local_sum = 0;
-                KERNEL_LOOP(i, HIDDEN_DIM) local_sum += abs((long long)s_ptr[b*SHARED_STRIDE + i]);
-                long long sum = blockReduceSum64(local_sum);
-                if(!sum) sum=1; long long mean = sum/HIDDEN_DIM; if(!mean) mean=1;
-                KERNEL_LOOP(i, HIDDEN_DIM) s_ptr[b*SHARED_STRIDE + i] = clip(((long long)s_ptr[b*SHARED_STRIDE + i] * model->ln_weights[l][1][i]) / mean);
+            long long local_mlp_sum = 0;
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                local_mlp_sum += abs((long long)my_s_ptr[i]);
             }
-            __syncthreads(); 
+            long long sum_mlp = warpReduceSum64(local_mlp_sum);
+            if(!sum_mlp) sum_mlp=1; long long mean_mlp = sum_mlp/HIDDEN_DIM; if(!mean_mlp) mean_mlp=1;
+
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                my_s_ptr[i] = clip(((long long)my_s_ptr[i] * model->ln_weights[l][1][i]) / mean_mlp);
+            }
+            __syncwarp(); 
             
             // Expand
-            // Buffer in Registers!
-            int8_t mlp_res[BATCH][MAX_STRIDE][4];
-            long long xB_mlp1[BATCH];
+            int8_t mlp_res[MAX_STRIDE][4];
             
             // Rank-1 xB
-            for(int b=0; b<BATCH; b++) {
-                 int p_idx = block_p_idx * BATCH + b;
-                 int pair_idx = p_idx / 2;
-                 uint32_t seed = (step_seed+pair_idx) + (l * 100) + SEED_OFF_MLP_EXP;
-                 long long ls = 0;
-                 KERNEL_LOOP(i, HIDDEN_DIM) {
-                     int8_t b_val = noise_from_hash(seed + SHARED_STRIDE, i); 
-                     ls += (long long)s_ptr[b*SHARED_STRIDE+i] * b_val;
-                 }
-                 xB_mlp1[b] = blockReduceSum64(ls);
+            uint32_t seed_exp = (step_seed+pair_idx) + (l * 100) + SEED_OFF_MLP_EXP;
+            long long ls_exp = 0;
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                int8_t b_val = noise_from_hash(seed_exp + SHARED_STRIDE, i); 
+                ls_exp += (long long)my_s_ptr[i] * b_val;
             }
+            long long xB_mlp1 = warpReduceSum64(ls_exp);
 
             const int8_t *w_mlp1 = &model->mlp_weights[l][0][0];
             
-            KERNEL_LOOP(i, HIDDEN_DIM) {
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
                  for(int sub=0; sub<4; sub++) {
                       int out_idx = i + sub * HIDDEN_DIM;
-                      long long acc_mlp[BATCH]; for(int b=0; b<BATCH; b++) acc_mlp[b]=0;
+                      long long acc_mlp = 0;
                       
                       for(int k=0; k<HIDDEN_DIM; k++) {
-                          int8_t w_val = w_mlp1[k*(4*HIDDEN_DIM) + out_idx];
-                          for(int b=0; b<BATCH; b++) {
-                              acc_mlp[b] += (long long)s_ptr[b*SHARED_STRIDE + k] * w_val;
-                          }
+                          acc_mlp += (long long)my_s_ptr[k] * w_mlp1[k*(4*HIDDEN_DIM) + out_idx];
                       }
                       
-                      for(int b=0; b<BATCH; b++) {
-                         int p_idx = block_p_idx * BATCH + b;
-                         int ns = (p_idx % 2 == 0) ? 1 : -1;
-                         int pair_idx = p_idx / 2;
-                         uint32_t seed = (step_seed+pair_idx) + (l * 100) + SEED_OFF_MLP_EXP;
-                         
-                         int8_t a_val = noise_from_hash(seed, out_idx);
-                         if(ns!=0) acc_mlp[b] += ((xB_mlp1[b] * (long long)a_val) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
-                         mlp_res[b][(i - threadIdx.x)/blockDim.x][sub] = clip(acc_mlp[b] >> 8);
-                      }
+                      int8_t a_val = noise_from_hash(seed_exp, out_idx);
+                      if(ns!=0) acc_mlp += ((xB_mlp1 * (long long)a_val) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
+                      mlp_res[i / WARP_SIZE][sub] = clip(acc_mlp >> 8);
                  }
              }
-             __syncthreads();
+             __syncwarp();
              
              // Write Expand to Shared
-             KERNEL_LOOP(i, HIDDEN_DIM) {
-                 for(int b=0; b<BATCH; b++) {
-                     for(int sub=0; sub<4; sub++) {
-                         s_ptr[b*SHARED_STRIDE + i + sub*HIDDEN_DIM] = mlp_res[b][(i - threadIdx.x)/blockDim.x][sub];
-                     }
+             for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                 for(int sub=0; sub<4; sub++) {
+                     my_s_ptr[i + sub*HIDDEN_DIM] = mlp_res[i / WARP_SIZE][sub];
                  }
              }
-             __syncthreads();
+             __syncwarp();
              
              // xB for M2 (Input 4*HIDDEN)
-             long long xB_mlp2[BATCH];
-             for(int b=0; b<BATCH; b++) {
-                 int p_idx = block_p_idx * BATCH + b;
-                 int pair_idx = p_idx / 2;
-                 uint32_t seed = (step_seed+pair_idx) + (l * 100) + SEED_OFF_MLP_PROJ;
-                 
-                 long long local_sum = 0;
-                 KERNEL_LOOP(i, HIDDEN_DIM) {
-                     for(int sub=0; sub<4; sub++) {
-                         int in_idx = i + sub*HIDDEN_DIM;
-                         int8_t b_val = noise_from_hash(seed + HIDDEN_DIM, in_idx);
-                         local_sum += (long long)s_ptr[b*SHARED_STRIDE + in_idx] * b_val;
-                     }
+             uint32_t seed_proj = (step_seed+pair_idx) + (l * 100) + SEED_OFF_MLP_PROJ;
+             long long ls_proj = 0;
+             for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                 for(int sub=0; sub<4; sub++) {
+                     int in_idx = i + sub*HIDDEN_DIM;
+                     int8_t b_val = noise_from_hash(seed_proj + HIDDEN_DIM, in_idx);
+                     ls_proj += (long long)my_s_ptr[in_idx] * b_val;
                  }
-                 xB_mlp2[b] = blockReduceSum64(local_sum);
              }
+             long long xB_mlp2 = warpReduceSum64(ls_proj);
              
              const int8_t *w_mlp2 = &model->mlp_weights[l][1][0];
-             KERNEL_LOOP(i, HIDDEN_DIM) {
-                 long long acc_proj[BATCH]; for(int b=0; b<BATCH; b++) acc_proj[b] = 0;
+             for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                 long long acc_proj = 0;
                  
                  for(int k=0; k<HIDDEN_DIM*4; k++) {
-                     int8_t w_val = w_mlp2[k*HIDDEN_DIM + i];
-                     for(int b=0; b<BATCH; b++) {
-                         acc_proj[b] += (long long)s_ptr[b*SHARED_STRIDE + k] * w_val;
-                     }
+                     acc_proj += (long long)my_s_ptr[k] * w_mlp2[k*HIDDEN_DIM + i];
                  }
                  
-                 for(int b=0; b<BATCH; b++) {
-                     int p_idx = block_p_idx * BATCH + b;
-                     int ns = (p_idx % 2 == 0) ? 1 : -1;
-                     int pair_idx = p_idx / 2;
-                     uint32_t seed = (step_seed+pair_idx) + (l * 100) + SEED_OFF_MLP_PROJ;
-                     
-                     int8_t a_val = noise_from_hash(seed, i);
-                     if(ns!=0) acc_proj[b] += ((xB_mlp2[b] * (long long)a_val) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
-                     
-                     int32_t res = acc_proj[b] >> 9; 
-                     s_ptr[b*SHARED_STRIDE + i] = clip(res + mlp_resid[b][(i - threadIdx.x)/blockDim.x]);
-                 }
+                 int8_t a_val = noise_from_hash(seed_proj, i);
+                 if(ns!=0) acc_proj += ((xB_mlp2 * (long long)a_val) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
+                 
+                 int32_t res = acc_proj >> 9; 
+                 my_s_ptr[i] = clip(res + mlp_resid[i / WARP_SIZE]);
              }
-             __syncthreads();
+             __syncwarp();
         } 
         
         // 3. Head LN
-        for(int b=0; b<BATCH; b++) {
-            long long local_sum = 0;
-            KERNEL_LOOP(i, HIDDEN_DIM) local_sum += abs((long long)s_ptr[b * SHARED_STRIDE + i]);
-            long long sum = blockReduceSum64(local_sum);
-            if(!sum) sum=1; long long mean = sum/HIDDEN_DIM; if(!mean) mean=1;
-            KERNEL_LOOP(i, HIDDEN_DIM) s_ptr[b * SHARED_STRIDE + i] = clip(((long long)s_ptr[b * SHARED_STRIDE + i] * model->ln_out[i]) / mean);
+        long long local_sum = 0;
+        for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+            local_sum += abs((long long)my_s_ptr[i]);
         }
-        __syncthreads();
+        long long sum = warpReduceSum64(local_sum);
+        if(!sum) sum=1; long long mean = sum/HIDDEN_DIM; if(!mean) mean=1;
+        
+        for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+             my_s_ptr[i] = clip(((long long)my_s_ptr[i] * model->ln_out[i]) / mean);
+        }
+        __syncwarp();
         
         // 4. Head Dense & Loss
-         long long xB_head[BATCH];
-         for(int b=0; b<BATCH; b++) {
-             int p_idx = block_p_idx * BATCH + b;
-             int pair_idx = p_idx / 2;
-             uint32_t seed = (step_seed+pair_idx) + SEED_OFF_HEAD;
-             long long ls = 0;
-             KERNEL_LOOP(i, HIDDEN_DIM) {
-                 int8_t b_val = noise_from_hash(seed + VOCAB_SIZE, i); 
-                 ls += (long long)s_ptr[b*SHARED_STRIDE+i] * b_val;
-             }
-             xB_head[b] = blockReduceSum64(ls);
+         uint32_t seed_head = (step_seed+pair_idx) + SEED_OFF_HEAD;
+         long long ls_head = 0;
+         for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+             int8_t b_val = noise_from_hash(seed_head + VOCAB_SIZE, i); 
+             ls_head += (long long)my_s_ptr[i] * b_val;
          }
+         long long xB_head = warpReduceSum64(ls_head);
          
          const int8_t *w_head = &model->head[0];
          
-         // We need logits for all vocab.
-         // KERNEL_LOOP over VOCAB_SIZE
-         KERNEL_LOOP(i, VOCAB_SIZE) {
-             long long acc[BATCH]; for(int b=0; b<BATCH; b++) acc[b]=0;
+         // Logits: KERNEL_LOOP not needed -> Warp Loop over VOCAB_SIZE
+         // Use lane_id similarly. VOCAB_SIZE = 256.
+         // 256 / 32 = 8 iters per thread.
+         for(int i = lane_id; i < VOCAB_SIZE; i += WARP_SIZE) {
+             long long acc = 0;
              for(int k=0; k<HIDDEN_DIM; k++) {
-                int8_t w = w_head[k*VOCAB_SIZE + i];
-                for(int b=0; b<BATCH; b++) acc[b] += (long long)s_ptr[b*SHARED_STRIDE + k] * w;
-            }
+                acc += (long long)my_s_ptr[k] * w_head[k*VOCAB_SIZE + i];
+             }
             
-            for(int b=0; b<BATCH; b++) {
-                 int p_idx = block_p_idx * BATCH + b;
-                 int ns = (p_idx % 2 == 0) ? 1 : -1;
-                 int pair_idx = p_idx / 2;
-                 uint32_t seed = (step_seed+pair_idx) + SEED_OFF_HEAD;
-                 
-                 int8_t a_val = noise_from_hash(seed, i);
-                 if(ns!=0) acc[b] += ((xB_head[b] * (long long)a_val) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
-                 // Store logit temporarily? or reuse shared?
-                 // We can reuse shared offset HIDDEN_DIM + i?
-                 // s_ptr is 4*HIDDEN.
-                 // HEAD needs VOCAB.
-                 // s_ptr[HIDDEN_DIM...] is free.
-                 s_ptr[b * SHARED_STRIDE + HIDDEN_DIM + i] = clip(acc[b] >> 8); 
-            }
+             int8_t a_val = noise_from_hash(seed_head, i);
+             if(ns!=0) acc += ((xB_head * (long long)a_val) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
+             
+             // Store logit temporarily in shared mem (offset HIDDEN_DIM)
+             my_s_ptr[HIDDEN_DIM + i] = clip(acc >> 8); 
          }
-         __syncthreads();
+         __syncwarp();
          
           // 5. Softmax Loss
-          uint8_t targets[BATCH];
-          if(threadIdx.x==0) {
-              for(int b=0; b<BATCH; b++) {
-                  int p_idx = block_p_idx * BATCH + b;
-                  long pair_idx = p_idx / 2;
-                  long stride = data_len / (POPULATION_SIZE / 2);
-                  long stream_pos = (start_idx + (pair_idx * stride)) % (data_len - SEQ_LEN);
-                  targets[b] = dataset[stream_pos + t + 1];
-              }
-          }
-          __syncthreads();
-          // Broadcast targets? No need, loop uses it.
-          // But 'targets' is local array in thread 0.
-          // Need shared? 
-          __shared__ uint8_t s_targets[BATCH];
-          if(threadIdx.x==0) { for(int b=0; b<BATCH; b++) s_targets[b] = targets[b]; }
-          __syncthreads();
+          uint8_t target_token = dataset[stream_pos + t + 1];
           
-          for(int b=0; b<BATCH; b++) {
-              long long local_exp = 0;
-              KERNEL_LOOP(i, VOCAB_SIZE) {
-                  int idx = (int32_t)s_ptr[b*SHARED_STRIDE + HIDDEN_DIM + i] + 128;
-                  idx = idx < 0 ? 0 : (idx > 255 ? 255 : idx);
-                  local_exp += d_EXP2_TABLE[idx];
-              }
-              long long sum_exp = blockReduceSum64(local_exp);
-              
-              long long log_sum = 0;
-              if(threadIdx.x==0) {
-                 long long x = sum_exp;
-                 if (x > 0) {
-                     int pos = 0;
-                     while(x >= 65536) { x >>= 16; pos += 16; }
-                     if (x >= 256)  { x >>= 8;  pos += 8; }
-                     if (x >= 16)   { x >>= 4;  pos += 4; }
-                     if (x >= 4)    { x >>= 2;  pos += 2; }
-                     if (x >= 2)    {           pos += 1; }
-                     
-                     long long fraction = (pos>=4) ? (sum_exp-(1LL<<pos))>>(pos-4) : (sum_exp-(1LL<<pos))<<(4-pos);
-                     log_sum = (pos<<4) + fraction - 64;
-                 }
-                 
-                 int32_t target_l = (int32_t)s_ptr[b*SHARED_STRIDE + HIDDEN_DIM + s_targets[b]] + 128;
-                 my_loss[b] += (log_sum - target_l);
-              }
+          long long local_exp = 0;
+          for(int i = lane_id; i < VOCAB_SIZE; i += WARP_SIZE) {
+              int idx = (int32_t)my_s_ptr[HIDDEN_DIM + i] + 128;
+              idx = idx < 0 ? 0 : (idx > 255 ? 255 : idx);
+              local_exp += d_EXP2_TABLE[idx];
           }
-
+          long long sum_exp = warpReduceSum64(local_exp);
+          
+          // Only lane 0 needs to compute final log_sum for this batch item
+          if(lane_id == 0) {
+             long long log_sum = 0;
+             long long x = sum_exp;
+             if (x > 0) {
+                 int pos = 0;
+                 while(x >= 65536) { x >>= 16; pos += 16; }
+                 if (x >= 256)  { x >>= 8;  pos += 8; }
+                 if (x >= 16)   { x >>= 4;  pos += 4; }
+                 if (x >= 4)    { x >>= 2;  pos += 2; }
+                 if (x >= 2)    {           pos += 1; }
+                 
+                 long long fraction = (pos>=4) ? (sum_exp-(1LL<<pos))>>(pos-4) : (sum_exp-(1LL<<pos))<<(4-pos);
+                 log_sum = (pos<<4) + fraction - 64;
+             }
+             
+             int32_t target_l = (int32_t)my_s_ptr[HIDDEN_DIM + target_token] + 128;
+             my_loss += (log_sum - target_l);
+          }
     } // Seq Loop
     
-    if (threadIdx.x == 0) {
-        for(int b=0; b<BATCH; b++) accum_loss[block_p_idx * BATCH + b] = (int32_t)my_loss[b]; // Loss fits in int32 usually, but accumulator is LL inside
+    if (lane_id == 0) {
+        accum_loss[p_idx] = (int32_t)my_loss;
     }
     
     // Store State
-    KERNEL_LOOP(i, HIDDEN_DIM) {
-        for(int b=0; b<BATCH; b++) {
-            int p_idx = block_p_idx * BATCH + b;
-            for(int l=0; l<N_LAYERS; l++) {
-                 pop_states[p_idx * (N_LAYERS * HIDDEN_DIM) + l * HIDDEN_DIM + i] = h_local[b][l][(i - threadIdx.x)/blockDim.x];
-            }
+    for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+        int sub = i / WARP_SIZE; 
+        for(int l=0; l<N_LAYERS; l++) {
+             pop_states[p_idx * (N_LAYERS * HIDDEN_DIM) + l * HIDDEN_DIM + i] = h_local[l][sub];
         }
     }
 }
@@ -917,8 +813,13 @@ int main() {
         uint32_t seed = (uint32_t)time(NULL) ^ (step * 0x9e3779b9);
         int start_idx = step * SEQ_LEN;
         
-        size_t shared_mem_size = BATCH * SHARED_STRIDE;
-        train_sequence_kernel<<<POPULATION_SIZE / BATCH, 256, shared_mem_size>>>(
+        // New Grid Config
+        int threads_per_block = BLOCK_THREADS;
+        int warps_per_block = BLOCK_THREADS / WARP_SIZE;
+        int blocks = POPULATION_SIZE / warps_per_block;
+        size_t shared_mem_size = warps_per_block * SHARED_STRIDE;
+        
+        train_sequence_kernel<<<blocks, threads_per_block, shared_mem_size>>>(
             d_dataset, ds.length, start_idx, d_model, d_pop_states, d_accum_loss, seed
         );
         cudaDeviceSynchronize();
