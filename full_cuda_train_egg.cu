@@ -625,7 +625,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS) train_sequence_kernel(
                  int8_t a_val = noise_from_hash(seed_proj, i);
                  if(ns!=0) acc_proj += ((xB_mlp2 * (long long)a_val) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
                  
-                 int32_t res = acc_proj >> 9; 
+                 int32_t res = acc_proj >> 8; 
                  my_s_ptr[i] = clip(res + mlp_resid[i / WARP_SIZE]);
              }
              __syncwarp();
