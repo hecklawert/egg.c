@@ -5,6 +5,16 @@
 #include <time.h>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#include <signal.h>
+#include <unistd.h>
+
+volatile sig_atomic_t keep_running = 1;
+
+void handle_sigint(int sig) {
+    const char msg[] = "\n[SIGINT] Interrupt received. Stopping after current step...\n";
+    write(STDOUT_FILENO, msg, sizeof(msg)-1);
+    keep_running = 0;
+}
 
 // --- Configuration ---
 #define SM_CORES 128
@@ -12,14 +22,17 @@
 #define BLOCK_THREADS 256
 #define BATCH WARP_SIZE
 #define VOCAB_SIZE 256
-#define HIDDEN_DIM (SM_CORES * 1)
+#define HIDDEN_DIM (SM_CORES * 2)
 #define N_LAYERS 4
 #define SEQ_LEN 256
-#define POPULATION_SIZE (SM_CORES * 128)
+#define POPULATION_SIZE (SM_CORES * 512*4)
 #define SHARED_STRIDE (HIDDEN_DIM * 4)
 #define FIXED_POINT 4
 #define SIGMA_SHIFT 4
-#define UPDATE_THRESHOLD 870 * 40
+// Vectors (Biases, LayerNorm) use linear noise (~16 avg), while Matrices use quadratic (~256 avg).
+// We reduce the shift for vectors to prevent perturbations from rounding to zero (which freezes learning).
+#define SIGMA_SHIFT_VECTOR (SIGMA_SHIFT - 2)
+// UPDATE_THRESHOLD is now dynamic
 #define MAX_VAL 127
 #define MIN_VAL -127
 
@@ -72,6 +85,17 @@ int32_t h_EXP2_TABLE[256];
 __device__ int32_t d_debug_updates[2]; // 0: Inc, 1: Dec
 
 // --- Helpers (Host) ---
+
+int get_update_threshold(double loss) {
+    // Learning Schedule: Adjust threshold based on loss
+    // Higher threshold = harder to update (lower learning rate equivalent)
+    // Lower threshold = easier to update (higher learning rate equivalent)
+    if (loss > 5.0) return 1000;
+    if (loss > 4.0) return 2000;
+    if (loss > 2.0) return 69000; // ~69000 * 4
+    if (loss > 1.0) return 200000;
+    return 400000; 
+}
 
 void init_tables() {
     for(int i=0; i<256; i++) 
@@ -471,7 +495,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS) train_sequence_kernel(
             for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
                 int8_t w = model->ln_weights[l][0][i];
                 int8_t a = noise_from_hash(seed + SEED_OFF_LN_W1, i);
-                long long perturb = ((long long)a * ns) >> SIGMA_SHIFT;
+                long long perturb = ((long long)a * ns) >> SIGMA_SHIFT_VECTOR;
                 my_s_ptr[i] = clip(((long long)my_s_ptr[i] * (w + perturb)) / mean);
             }
             __syncwarp();
@@ -518,7 +542,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS) train_sequence_kernel(
                  
                  int8_t b_gate = model->gru_biases[l][0][i];
                  int8_t a_gate = noise_from_hash(seed + SEED_OFF_GRU_B1, i);
-                 long long p_gate = ((long long)a_gate * ns) >> SIGMA_SHIFT;
+                 long long p_gate = ((long long)a_gate * ns) >> SIGMA_SHIFT_VECTOR;
 
                  int8_t ft = clip((dot1 >> 8) + (dot2 >> 8) + (b_gate + p_gate));
                  int8_t h_val = my_s_ptr[HIDDEN_DIM + i];
@@ -562,7 +586,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS) train_sequence_kernel(
                 
                 int8_t b_ht = model->gru_biases[l][1][i];
                 int8_t a_ht = noise_from_hash(seed + SEED_OFF_GRU_B2, i);
-                long long p_ht = ((long long)a_ht * ns) >> SIGMA_SHIFT;
+                long long p_ht = ((long long)a_ht * ns) >> SIGMA_SHIFT_VECTOR;
 
                 int8_t ht = clip((dot1 >> 8) + (dot2 >> 8) + (b_ht + p_ht));
                 
@@ -594,7 +618,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS) train_sequence_kernel(
             for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
                 int8_t w = model->ln_weights[l][1][i];
                 int8_t a = noise_from_hash(seed + SEED_OFF_LN_W2, i);
-                long long p = ((long long)a * ns) >> SIGMA_SHIFT;
+                long long p = ((long long)a * ns) >> SIGMA_SHIFT_VECTOR;
                 my_s_ptr[i] = clip(((long long)my_s_ptr[i] * (w + p)) / mean_mlp);
             }
             __syncwarp(); 
@@ -678,7 +702,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS) train_sequence_kernel(
         for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
              int8_t w = model->ln_out[i];
              int8_t a = noise_from_hash(seed_ln_out + SEED_OFF_LN_OUT, i);
-             long long p = ((long long)a * ns) >> SIGMA_SHIFT;
+             long long p = ((long long)a * ns) >> SIGMA_SHIFT_VECTOR;
              my_s_ptr[i] = clip(((long long)my_s_ptr[i] * (w + p)) / mean);
         }
         __syncwarp();
@@ -764,7 +788,8 @@ __global__ void update_matrix_kernel(
     int offset_B,
     int seed_base_add,
     const int32_t * __restrict__ fitnesses,
-    uint32_t step_seed
+    uint32_t step_seed,
+    int threshold
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= rows * cols) return;
@@ -788,11 +813,11 @@ __global__ void update_matrix_kernel(
     
     int8_t w_curr = W[c * rows + r]; 
 
-    if(vote > UPDATE_THRESHOLD && w_curr < MAX_VAL) {
+    if(vote > threshold && w_curr < MAX_VAL) {
         w_curr++;
         atomicAdd(&d_debug_updates[0], 1);
     }
-    else if(vote < -UPDATE_THRESHOLD && w_curr > MIN_VAL) {
+    else if(vote < -threshold && w_curr > MIN_VAL) {
         w_curr--;
         atomicAdd(&d_debug_updates[1], 1);
     }
@@ -805,7 +830,8 @@ __global__ void update_vector_kernel(
     int seed_off_A,
     int seed_base_add,
     const int32_t * __restrict__ fitnesses,
-    uint32_t step_seed
+    uint32_t step_seed,
+    int threshold
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= len) return;
@@ -825,11 +851,11 @@ __global__ void update_vector_kernel(
     
     int8_t v_curr = V[idx];
 
-    if(vote > UPDATE_THRESHOLD && v_curr < MAX_VAL) {
+    if(vote > threshold && v_curr < MAX_VAL) {
         v_curr++;
         atomicAdd(&d_debug_updates[0], 1);
     }
-    else if(vote < -UPDATE_THRESHOLD && v_curr > MIN_VAL) {
+    else if(vote < -threshold && v_curr > MIN_VAL) {
         v_curr--;
         atomicAdd(&d_debug_updates[1], 1);
     }
@@ -837,6 +863,7 @@ __global__ void update_vector_kernel(
 }
 
 int main() {
+    signal(SIGINT, handle_sigint);
     srand(time(NULL));
     
     cudaDeviceProp prop;
@@ -853,6 +880,49 @@ int main() {
     ds.data=(uint8_t*)malloc(ds.length); 
     if(!fread(ds.data,1,ds.length,f)) { printf("Error reading input.txt\n"); exit(1); }
     fclose(f); 
+
+    // --- Config & Stats Dump ---
+    {
+        long long params_embedding = (long long)VOCAB_SIZE * HIDDEN_DIM;
+        long long params_gru = (long long)N_LAYERS * 4 * HIDDEN_DIM * HIDDEN_DIM;
+        long long params_gru_bias = (long long)N_LAYERS * 2 * HIDDEN_DIM;
+        long long params_mlp = (long long)N_LAYERS * 2 * 4 * HIDDEN_DIM * HIDDEN_DIM;
+        long long params_ln = (long long)N_LAYERS * 2 * HIDDEN_DIM;
+        long long params_ln_out = (long long)HIDDEN_DIM;
+        long long params_head = (long long)HIDDEN_DIM * VOCAB_SIZE;
+        long long total_params = params_embedding + params_gru + params_gru_bias + 
+                                 params_mlp + params_ln + params_ln_out + params_head;
+
+        long long mem_model = total_params; 
+        long long mem_pop_states = (long long)POPULATION_SIZE * N_LAYERS * HIDDEN_DIM;
+        long long mem_dataset = ds.length;
+        long long mem_overhead = (long long)POPULATION_SIZE * sizeof(int32_t) * 2; // Accum buffers etc.
+
+        printf("\n================ CONFIGURATION DUMP ================\n");
+        printf("  Device: %s\n", prop.name);
+        printf("----------------------------------------------------\n");
+        printf("  SM Cores:        %d\n", SM_CORES);
+        printf("  Population Size: %d\n", POPULATION_SIZE);
+        printf("  Hidden Dim:      %d\n", HIDDEN_DIM);
+        printf("  Layers:          %d\n", N_LAYERS);
+        printf("  Sequence Len:    %d\n", SEQ_LEN);
+        printf("  Vocab Size:      %d\n", VOCAB_SIZE);
+        printf("----------------------------------------------------\n");
+        printf("  Total Parameters: %lld (%.2f M)\n", total_params, total_params/1000000.0);
+        printf("    - Embedding:    %lld\n", params_embedding);
+        printf("    - GRU Weights:  %lld\n", params_gru);
+        printf("    - MLP Weights:  %lld\n", params_mlp);
+        printf("    - Head:         %lld\n", params_head);
+        printf("    - Other (Bias): %lld\n", params_gru_bias + params_ln + params_ln_out);
+        printf("----------------------------------------------------\n");
+        printf("  Memory Usage Estimates:\n");
+        printf("    - Model (8-bit):     %.2f MB\n", mem_model / (1024.0*1024.0));
+        printf("    - Population States: %.2f MB\n", mem_pop_states / (1024.0*1024.0));
+        printf("    - Dataset:           %.2f MB\n", mem_dataset / (1024.0*1024.0));
+        printf("    - Overhead/Buffers:  %.2f MB\n", mem_overhead / (1024.0*1024.0));
+        printf("  TOTAL ESTIMATED VRAM:  %.2f MB\n", (mem_model + mem_pop_states + mem_dataset + mem_overhead) / (1024.0*1024.0));
+        printf("====================================================\n\n");
+    }
 
     EggModel *h_model = (EggModel*)malloc(sizeof(EggModel));
     init_model(h_model); 
@@ -885,7 +955,7 @@ int main() {
     clock_gettime(CLOCK_MONOTONIC, &start);
     unsigned long total_tokens = 0;
 
-    for(long step=0; step<max_steps; step++) {
+    for(long step=0; step<max_steps && keep_running; step++) {
         uint32_t seed = (uint32_t)time(NULL) ^ (step * 0x9e3779b9);
         int start_idx = step * SEQ_LEN;
         
@@ -903,19 +973,30 @@ int main() {
         CHECK_CUDA(cudaMemcpy(h_accum_loss, d_accum_loss, POPULATION_SIZE * sizeof(int32_t), cudaMemcpyDeviceToHost));
         
         int fit_sum = 0;
+        double current_accum_total = 0;
         for(int p=0; p < POPULATION_SIZE/2; p++) {
              int32_t loss_pos = h_accum_loss[2*p];
              int32_t loss_neg = h_accum_loss[2*p+1];
+             
+             current_accum_total += loss_pos + loss_neg;
+
              if (loss_pos < loss_neg) h_fitnesses[p] = 1;
              else if (loss_neg < loss_pos) h_fitnesses[p] = -1;
              else h_fitnesses[p] = 0;
              fit_sum += abs(h_fitnesses[p]);
         }
+        double current_avg_loss = current_accum_total / POPULATION_SIZE;
+        double current_loss_per_token = current_avg_loss / (SEQ_LEN * (1 << FIXED_POINT));
+        
+        int current_threshold = get_update_threshold(current_loss_per_token);
+
         CHECK_CUDA(cudaMemcpy(d_fitnesses, h_fitnesses, (POPULATION_SIZE/2) * sizeof(int32_t), cudaMemcpyHostToDevice));
+        
+        if (!keep_running) break;
 
         if (step % 10 == 0) {
-            printf("[Debug] Step %ld Pair 0: Pos=%d Neg=%d Fit=%d | Total NonZero Fits: %d\n", 
-                step, h_accum_loss[0], h_accum_loss[1], h_fitnesses[0], fit_sum);
+            printf("[Debug] Step %ld Pair 0: Pos=%d Neg=%d Fit=%d | Threshold=%d | Total NonZero Fits: %d\n", 
+                step, h_accum_loss[0], h_accum_loss[1], h_fitnesses[0], current_threshold, fit_sum);
         }
         
         int32_t zeros[2] = {0, 0};
@@ -933,7 +1014,7 @@ int main() {
                      (int8_t*)d_model + off_g + g*gru_size, 
                      HIDDEN_DIM, HIDDEN_DIM, 
                      seed_off, seed_off + HIDDEN_DIM, 
-                     seed_base, d_fitnesses, seed
+                     seed_base, d_fitnesses, seed, current_threshold
                  );
              }
              
@@ -945,33 +1026,33 @@ int main() {
              update_matrix_kernel<<< (exp_rows*exp_cols + 511)/512, 512 >>>(
                  (int8_t*)d_model + off_m + 0, exp_rows, exp_cols, 
                  0, SHARED_STRIDE, 
-                 seed_base + SEED_OFF_MLP_EXP, d_fitnesses, seed
+                 seed_base + SEED_OFF_MLP_EXP, d_fitnesses, seed, current_threshold
              );
              
              update_matrix_kernel<<< (HIDDEN_DIM*(4*HIDDEN_DIM) + 511)/512, 512 >>>(
                  (int8_t*)d_model + off_m + mlp_exp_size, HIDDEN_DIM, 4*HIDDEN_DIM, 
                  0, HIDDEN_DIM, 
-                 seed_base + SEED_OFF_MLP_PROJ, d_fitnesses, seed
+                 seed_base + SEED_OFF_MLP_PROJ, d_fitnesses, seed, current_threshold
              );
 
              // Biases & LN
              long off_b = offsetof(EggModel, gru_biases) + (l * 2 * HIDDEN_DIM);
-             update_vector_kernel<<< (HIDDEN_DIM+511)/512, 512 >>>((int8_t*)d_model + off_b, HIDDEN_DIM, SEED_OFF_GRU_B1, seed_base, d_fitnesses, seed);
-             update_vector_kernel<<< (HIDDEN_DIM+511)/512, 512 >>>((int8_t*)d_model + off_b + HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_GRU_B2, seed_base, d_fitnesses, seed);
+             update_vector_kernel<<< (HIDDEN_DIM+511)/512, 512 >>>((int8_t*)d_model + off_b, HIDDEN_DIM, SEED_OFF_GRU_B1, seed_base, d_fitnesses, seed, current_threshold);
+             update_vector_kernel<<< (HIDDEN_DIM+511)/512, 512 >>>((int8_t*)d_model + off_b + HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_GRU_B2, seed_base, d_fitnesses, seed, current_threshold);
 
              long off_ln = offsetof(EggModel, ln_weights) + (l * 2 * HIDDEN_DIM);
-             update_vector_kernel<<< (HIDDEN_DIM+511)/512, 512 >>>((int8_t*)d_model + off_ln, HIDDEN_DIM, SEED_OFF_LN_W1, seed_base, d_fitnesses, seed);
-             update_vector_kernel<<< (HIDDEN_DIM+511)/512, 512 >>>((int8_t*)d_model + off_ln + HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_LN_W2, seed_base, d_fitnesses, seed);
+             update_vector_kernel<<< (HIDDEN_DIM+511)/512, 512 >>>((int8_t*)d_model + off_ln, HIDDEN_DIM, SEED_OFF_LN_W1, seed_base, d_fitnesses, seed, current_threshold);
+             update_vector_kernel<<< (HIDDEN_DIM+511)/512, 512 >>>((int8_t*)d_model + off_ln + HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_LN_W2, seed_base, d_fitnesses, seed, current_threshold);
         }
         
         long off_ln_out = offsetof(EggModel, ln_out);
-        update_vector_kernel<<< (HIDDEN_DIM+511)/512, 512 >>>((int8_t*)d_model + off_ln_out, HIDDEN_DIM, SEED_OFF_LN_OUT, 0, d_fitnesses, seed);
+        update_vector_kernel<<< (HIDDEN_DIM+511)/512, 512 >>>((int8_t*)d_model + off_ln_out, HIDDEN_DIM, SEED_OFF_LN_OUT, 0, d_fitnesses, seed, current_threshold);
 
         long off_head = offsetof(EggModel, head);
         update_matrix_kernel<<< (VOCAB_SIZE*HIDDEN_DIM + 511)/512, 512 >>>(
             (int8_t*)d_model + off_head, VOCAB_SIZE, HIDDEN_DIM, 
             0, VOCAB_SIZE, 
-            SEED_OFF_HEAD, d_fitnesses, seed
+            SEED_OFF_HEAD, d_fitnesses, seed, current_threshold
         );
         
         // Update embedding (column-major: rows=HIDDEN_DIM, cols=VOCAB_SIZE)
@@ -981,9 +1062,11 @@ int main() {
         update_matrix_kernel<<< (VOCAB_SIZE*HIDDEN_DIM + 511)/512, 512 >>>(
             (int8_t*)d_model + off_emb, HIDDEN_DIM, VOCAB_SIZE, 
             HIDDEN_DIM, 0,  // Swapped: offset_A=HIDDEN_DIM (for B/feature), offset_B=0 (for A/token)
-            SEED_OFF_EMB, d_fitnesses, seed
+            SEED_OFF_EMB, d_fitnesses, seed, current_threshold
         );
         cudaDeviceSynchronize();
+        
+        if (!keep_running) break;
 
         clock_gettime(CLOCK_MONOTONIC, &end);
         total_tokens += POPULATION_SIZE * SEQ_LEN;
@@ -1026,16 +1109,34 @@ int main() {
             }
             printf("\033[0m\n");
 
-            double avg_loss = 0;
-            for(int i=0; i<POPULATION_SIZE; i++) avg_loss += h_accum_loss[i];
-            avg_loss /= (double)(POPULATION_SIZE); 
-            double loss_per_token = avg_loss / (SEQ_LEN * (1 << FIXED_POINT));
+            // Already calculated above: current_loss_per_token
             
             double total_t = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec)/1e9;
             
             printf("\nStep %ld | Loss: %.4f | Up+: %d Up-: %d | GPU Sample: %.2f ms | Tok/s: %.2f\n", 
-               step, loss_per_token, h_updates[0], h_updates[1], sample_ms,  total_tokens / total_t); 
+               step, current_loss_per_token, h_updates[0], h_updates[1], sample_ms,  total_tokens / total_t); 
         }
     }
+
+    if (!keep_running) {
+        printf("\nTraining interrupted by User. Exiting gracefully...\n");
+    }
+
+    // --- Cleanup ---
+    printf("Cleaning up resources...\n");
+    free(ds.data);
+    free(h_model);
+    free(h_accum_loss);
+    free(h_fitnesses);
+    
+    cudaFree(d_model);
+    cudaFree(d_dataset);
+    cudaFree(d_accum_loss);
+    cudaFree(d_fitnesses);
+    cudaFree(d_pop_states);
+    
+    // Note: d_output is static in the loop scope, so technically leaks in this context 
+    // but will be cleaned up by OS on exit. 
+
     return 0;
 }
