@@ -22,10 +22,10 @@ void handle_sigint(int sig) {
 #define BLOCK_THREADS 256
 #define BATCH WARP_SIZE
 #define VOCAB_SIZE 256
-#define HIDDEN_DIM (SM_CORES * 2)
+#define HIDDEN_DIM (SM_CORES * 1)
 #define N_LAYERS 4
 #define SEQ_LEN 256
-#define POPULATION_SIZE (SM_CORES * 512*4)
+#define POPULATION_SIZE (SM_CORES * 512*1)
 #define SHARED_STRIDE (HIDDEN_DIM * 4)
 #define FIXED_POINT 4
 #define SIGMA_SHIFT 4
@@ -91,10 +91,17 @@ int get_update_threshold(double loss) {
     // Higher threshold = harder to update (lower learning rate equivalent)
     // Lower threshold = easier to update (higher learning rate equivalent)
     if (loss > 5.0) return 1000;
-    if (loss > 4.0) return 2000;
-    if (loss > 2.0) return 69000; // ~69000 * 4
-    if (loss > 1.0) return 200000;
+    if (loss > 4.0) return 5000;
+    if (loss > 3.8) return 30000;
+    if (loss > 3.6) return 60000;
+    if (loss > 3.5) return 130000; // ~69000 * 4
+    if (loss > 1.0) return 270000;
     return 400000; 
+}
+
+double get_time_diff_ms(struct timespec start, struct timespec end) {
+    return ((end.tv_sec - start.tv_sec) * 1000.0) + 
+           ((end.tv_nsec - start.tv_nsec) / 1e6);
 }
 
 void init_tables() {
@@ -956,6 +963,9 @@ int main() {
     unsigned long total_tokens = 0;
 
     for(long step=0; step<max_steps && keep_running; step++) {
+        struct timespec t0, t1, t2, t3;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+
         uint32_t seed = (uint32_t)time(NULL) ^ (step * 0x9e3779b9);
         int start_idx = step * SEQ_LEN;
         
@@ -969,6 +979,7 @@ int main() {
             d_dataset, ds.length, start_idx, d_model, d_pop_states, d_accum_loss, seed
         );
         cudaDeviceSynchronize();
+        clock_gettime(CLOCK_MONOTONIC, &t1);
         
         CHECK_CUDA(cudaMemcpy(h_accum_loss, d_accum_loss, POPULATION_SIZE * sizeof(int32_t), cudaMemcpyDeviceToHost));
         
@@ -991,6 +1002,7 @@ int main() {
         int current_threshold = get_update_threshold(current_loss_per_token);
 
         CHECK_CUDA(cudaMemcpy(d_fitnesses, h_fitnesses, (POPULATION_SIZE/2) * sizeof(int32_t), cudaMemcpyHostToDevice));
+        clock_gettime(CLOCK_MONOTONIC, &t2);
         
         if (!keep_running) break;
 
@@ -1065,6 +1077,7 @@ int main() {
             SEED_OFF_EMB, d_fitnesses, seed, current_threshold
         );
         cudaDeviceSynchronize();
+        clock_gettime(CLOCK_MONOTONIC, &t3);
         
         if (!keep_running) break;
 
@@ -1094,8 +1107,7 @@ int main() {
             CHECK_CUDA(cudaMemcpy(h_output, d_output, gen_len, cudaMemcpyDeviceToHost));
             
             clock_gettime(CLOCK_MONOTONIC, &t_samp_end);
-            double sample_ms = ((t_samp_end.tv_sec - t_samp_start.tv_sec) * 1000.0) + 
-                               ((t_samp_end.tv_nsec - t_samp_start.tv_nsec) / 1e6);
+            double sample_ms = get_time_diff_ms(t_samp_start, t_samp_end);
             
             printf("\033[32m");
             for(int i=0; i<seed_len; i++) {
@@ -1109,12 +1121,18 @@ int main() {
             }
             printf("\033[0m\n");
 
-            // Already calculated above: current_loss_per_token
+            // Timing instrumentation
+            double fwd_ms = get_time_diff_ms(t0, t1);
+            double host_ms = get_time_diff_ms(t1, t2);
+            double upd_ms = get_time_diff_ms(t2, t3);
+            double step_ms = get_time_diff_ms(t0, t3);
+            double steps_per_sec = (step_ms > 0) ? (1000.0 / step_ms) : 0.0;
             
             double total_t = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec)/1e9;
             
-            printf("\nStep %ld | Loss: %.4f | Up+: %d Up-: %d | GPU Sample: %.2f ms | Tok/s: %.2f\n", 
-               step, current_loss_per_token, h_updates[0], h_updates[1], sample_ms,  total_tokens / total_t); 
+            printf("\nStep %ld | Loss: %.4f | Up+: %d Up-: %d | Fwd: %.1fms Host: %.1fms Upd: %.1fms | %.2f Steps/s | Tok/s: %.2f\n", 
+               step, current_loss_per_token, h_updates[0], h_updates[1], 
+               fwd_ms, host_ms, upd_ms, steps_per_sec, total_tokens / total_t); 
         }
     }
 
