@@ -8,6 +8,8 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #include <thrust/device_ptr.h>
 #include <thrust/reduce.h>
@@ -25,9 +27,9 @@ void handle_sigint(int sig) {
 }
 
 // --- CONFIGURATION ---
-#define HIDDEN_DIM 384
+#define HIDDEN_DIM 256
 #define HEAD_DIM 64
-#define N_LAYERS 4
+#define N_LAYERS 12
 #define SEQ_LEN 128     
 #define VOCAB_SIZE 256
 #define WARP_SIZE 32
@@ -37,7 +39,7 @@ void handle_sigint(int sig) {
 #define N_HEADS (HIDDEN_DIM / HEAD_DIM)
 
 // Population Sizing (Target 20GB)
-#define POPULATION_SIZE 8192 * 8
+#define POPULATION_SIZE 8192 * 5
 
 #define FIXED_POINT 4
 #define SIGMA_SHIFT 0
@@ -625,6 +627,50 @@ __global__ void generate_sequence_kernel(
     }
 }
 
+void ensure_models_dir() {
+    struct stat st = {0};
+    if (stat("models", &st) == -1) {
+        mkdir("models", 0700);
+    }
+}
+
+void update_last_link(const char *target_filename) {
+    const char *link_path = "models/egg_transformer_last.bin";
+    unlink(link_path);
+    symlink(target_filename, link_path);
+}
+
+void save_checkpoint(TransformerModel *model, long step) {
+    char filename_only[128];
+    sprintf(filename_only, "egg_step-%08ld.bin", step);
+    char full_path[256];
+    sprintf(full_path, "models/%s", filename_only);
+    
+    FILE *f = fopen(full_path, "wb");
+    if (!f) { printf("Error opening %s for writing\n", full_path); return; }
+    if (fwrite(model, sizeof(TransformerModel), 1, f) != 1) {
+        printf("Error writing model to %s\n", full_path);
+    } else {
+       // printf("Model saved to %s\n", full_path);
+        update_last_link(filename_only);
+    }
+    fclose(f);
+}
+
+int load_model(const char *filename, TransformerModel *model) {
+    FILE *f = fopen(filename, "rb");
+    if (!f) return 0;
+    printf("Loading model from %s...\n", filename);
+    if (fread(model, sizeof(TransformerModel), 1, f) != 1) {
+        printf("Error reading model from %s\n", filename);
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    printf("Model loaded successfully.\n");
+    return 1;
+}
+
 int main() {
     signal(SIGINT, handle_sigint);
     init_tables();
@@ -671,7 +717,12 @@ int main() {
     ds.data=(uint8_t*)malloc(ds.length); fread(ds.data,1,ds.length,f); fclose(f);
 
     TransformerModel *h_model = (TransformerModel*)calloc(1, sizeof(TransformerModel));
-    init_model(h_model);
+    ensure_models_dir();
+    if (load_model("models/egg_transformer_last.bin", h_model)) {
+        printf("Resumed from models/egg_transformer_last.bin\n");
+    } else {
+        init_model(h_model);
+    }
     TransformerModel *d_model; CHECK_CUDA(cudaMalloc(&d_model, sizeof(TransformerModel)));
     CHECK_CUDA(cudaMemcpy(d_model, h_model, sizeof(TransformerModel), cudaMemcpyHostToDevice));
 
@@ -776,6 +827,9 @@ int main() {
                 char c = h_buf[i]; printf("%c", (c>=32 && c<=126) ? c : '.');
             }
             printf("\033[0m\n\n");
+
+            CHECK_CUDA(cudaMemcpy(h_model, d_model, sizeof(TransformerModel), cudaMemcpyDeviceToHost));
+            save_checkpoint(h_model, step);
         }
     }
     cudaFree(d_gen_buf); cudaFree(d_gen_kv);
