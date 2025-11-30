@@ -9,10 +9,10 @@
 
 // --- Configuration [cite: 275, 277, 288] ---
 #define VOCAB_SIZE 256        // Byte-level tokenization
-#define HIDDEN_DIM 512        // Model width
-#define N_LAYERS 4            // Number of layers
-#define SEQ_LEN 4096            // Sequence length for BPTT (truncated)
-#define POPULATION_SIZE 128    // Number of perturbations per step
+#define HIDDEN_DIM 256        // Model width - REDUCED from 512
+#define N_LAYERS 2            // Number of layers - REDUCED from 4
+#define SEQ_LEN 128           // Sequence length for BPTT (truncated)
+#define POPULATION_SIZE 16    // Number of perturbations per step
 #define BATCH_SIZE 8          // Parallel streams
 #define FIXED_POINT 4         // 4 bits for fractional part
 #define SIGMA_SHIFT 4         // Noise scale (bitwise shift)
@@ -111,13 +111,23 @@ void matmul_perturbed(
     uint32_t layer_seed, int noise_sign,
     int shift
 ) {
-    // 1. Generate Noise Vectors A and B
-    int8_t A[rows];
-    int8_t B[cols];
+    // Allocate noise buffers once (max size is HIDDEN_DIM * 4 = 2048)
+    static __thread int8_t A_buf[2048];
+    static __thread int8_t B_buf[2048];
+    
+    int8_t *A = A_buf;
+    int8_t *B = B_buf;
     
     uint32_t rng = layer_seed;
-    gen_noise_vector_neon(&rng, A, rows);
-    gen_noise_vector_neon(&rng, B, cols);
+    // Fast inline noise generation
+    for(int i = 0; i < rows; i++) {
+        uint32_t r = xorshift32(&rng);
+        A[i] = (int8_t)((r & 1 ? 1 : -1) * ((r >> 1) & 31));
+    }
+    for(int i = 0; i < cols; i++) {
+        uint32_t r = xorshift32(&rng);
+        B[i] = (int8_t)((r & 1 ? 1 : -1) * ((r >> 1) & 31));
+    }
 
     // 2. Compute xB (Projection onto B)
     int32_t xB = 0;
@@ -518,49 +528,38 @@ int main() {
     memset(&main_state, 0, sizeof(RecurrentState));
 
     printf("Starting EGGROLL Training (Stateful + Optimized)...\n");
+    fflush(stdout);
     
     struct timespec start_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);
     long total_tokens = 0;
     long max_steps = (ds.length - 1) / SEQ_LEN;
+    
+    printf("Max steps: %ld, Dataset size: %ld bytes, SEQ_LEN: %d\n", max_steps, ds.length, SEQ_LEN);
+    fflush(stdout);
 
     for(long step=0; step < max_steps; step++) {
         // Use a more robust seed mixing to avoid correlations if time(NULL) doesn't change
         uint32_t step_seed = (uint32_t)time(NULL) ^ (step * 0x9e3779b9);
         int start_idx = step * SEQ_LEN;
-        
-        if(step % 10 == 0) {
-            sample_model(model, &ds.data[start_idx], 30, 30);
+
+        dispatch_apply(POPULATION_SIZE / 2, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^(size_t p_idx) {
+            uint32_t p_seed = step_seed + (uint32_t)p_idx;
+            int8_t local_logits[VOCAB_SIZE];
+            int32_t loss_pos = 0, loss_neg = 0;
             
-            int32_t loss_val = 0;
-            forward_pass(model, &ds.data[start_idx], &ds.data[start_idx+1], SEQ_LEN, logits, &loss_val, step_seed, 0, &main_state);
-            
-            struct timespec current_time;
-            clock_gettime(CLOCK_MONOTONIC, &current_time);
-            double elapsed_sec = (current_time.tv_sec - start_time.tv_sec) + 
-                                 (current_time.tv_nsec - start_time.tv_nsec) / 1e9;
-            double tps = (elapsed_sec > 0) ? (double)total_tokens / elapsed_sec : 0.0;
-            // Loss is accumulated fixed point. Divide by SEQ_LEN to get average per token, then by 2^FIXED_POINT
-            printf("Step %ld/%ld | Loss: %.4f | Tok/s: %.2f\n", step, max_steps, (double)loss_val / (SEQ_LEN * (1 << FIXED_POINT)), tps);
-        }
+            // Multi-stream: Distribute pairs across the dataset
+            long stride = ds.length / (POPULATION_SIZE / 2);
+            long stream_idx = (start_idx + (p_idx * stride)) % (ds.length - SEQ_LEN);
 
-    dispatch_apply(POPULATION_SIZE / 2, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^(size_t p_idx) {
-        uint32_t p_seed = step_seed + (uint32_t)p_idx;
-        int8_t local_logits[VOCAB_SIZE];
-        int32_t loss_pos = 0, loss_neg = 0;
-        
-        // Multi-stream: Distribute pairs across the dataset
-        long stride = ds.length / (POPULATION_SIZE / 2);
-        long stream_idx = (start_idx + (p_idx * stride)) % (ds.length - SEQ_LEN);
+            forward_pass(model, &ds.data[stream_idx], &ds.data[stream_idx+1], SEQ_LEN, local_logits, &loss_pos, p_seed, 1, &pop_states[p_idx*2]);
+            forward_pass(model, &ds.data[stream_idx], &ds.data[stream_idx+1], SEQ_LEN, local_logits, &loss_neg, p_seed, -1, &pop_states[p_idx*2+1]);
 
-        forward_pass(model, &ds.data[stream_idx], &ds.data[stream_idx+1], SEQ_LEN, local_logits, &loss_pos, p_seed, 1, &pop_states[p_idx*2]);
-        forward_pass(model, &ds.data[stream_idx], &ds.data[stream_idx+1], SEQ_LEN, local_logits, &loss_neg, p_seed, -1, &pop_states[p_idx*2+1]);
-
-        if (loss_pos < loss_neg) pair_fitnesses[p_idx] = 1;
-            else if (loss_neg < loss_pos) pair_fitnesses[p_idx] = -1;
-            else pair_fitnesses[p_idx] = 0;
+            if (loss_pos < loss_neg) pair_fitnesses[p_idx] = 1;
+                else if (loss_neg < loss_pos) pair_fitnesses[p_idx] = -1;
+                else pair_fitnesses[p_idx] = 0;
         });
-
+        
         for(int l=0; l<N_LAYERS; l++) {
             uint32_t l_seed = step_seed + (l * 100);
             update_matrix(model->gru_weights[l][0], HIDDEN_DIM, HIDDEN_DIM, l_seed+1, pair_fitnesses, POPULATION_SIZE);
@@ -574,6 +573,16 @@ int main() {
         update_matrix(model->head, VOCAB_SIZE, HIDDEN_DIM, step_seed+999, pair_fitnesses, POPULATION_SIZE);
 
         total_tokens += SEQ_LEN;
+        
+        if(step % 50 == 0 && step > 0) {
+            struct timespec current_time;
+            clock_gettime(CLOCK_MONOTONIC, &current_time);
+            double elapsed_sec = (current_time.tv_sec - start_time.tv_sec) + 
+                                 (current_time.tv_nsec - start_time.tv_nsec) / 1e9;
+            double tps = (elapsed_sec > 0) ? (double)total_tokens / elapsed_sec : 0.0;
+            printf("Step %ld/%ld | Tok/s: %.2f\n", step, max_steps, tps);
+            fflush(stdout);
+        }
     }
 
     printf("Training Done.\n");
