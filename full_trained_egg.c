@@ -574,13 +574,21 @@ int main() {
 
         total_tokens += SEQ_LEN;
         
-        if(step % 50 == 0 && step > 0) {
+        if(step % 100 == 0 && step > 0) {
+            // Show sample every 100 steps (less frequent to maintain speed)
+            sample_model(model, &ds.data[start_idx], 20, 20);
+            
+            // Compute loss without noise
+            int32_t loss_val = 0;
+            forward_pass(model, &ds.data[start_idx], &ds.data[start_idx+1], SEQ_LEN, logits, &loss_val, step_seed, 0, &main_state);
+            
             struct timespec current_time;
             clock_gettime(CLOCK_MONOTONIC, &current_time);
             double elapsed_sec = (current_time.tv_sec - start_time.tv_sec) + 
                                  (current_time.tv_nsec - start_time.tv_nsec) / 1e9;
             double tps = (elapsed_sec > 0) ? (double)total_tokens / elapsed_sec : 0.0;
-            printf("Step %ld/%ld | Tok/s: %.2f\n", step, max_steps, tps);
+            double loss = (double)loss_val / (SEQ_LEN * (1 << FIXED_POINT));
+            printf("Step %ld/%ld | Loss: %.4f | Tok/s: %.2f\n", step, max_steps, loss, tps);
             fflush(stdout);
         }
     }
